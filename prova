@@ -1,0 +1,328 @@
+Cooled And Heated Beam Air Terminal Unit
+================
+Design Document
+================
+
+**Brent Griffith, Energy Archmage Company**
+
+**( for GARD/NREL/DOE subtask 4.2.2)**
+
+ - July 18, 2015, original
+
+## Introduction ##
+
+This design document describes the planned implementation of a new air terminal unit for a four-pipe beam.  A separate new feature proposal describes the the input fields, engineering model, and how to develop input from manufacturers catalog data and can be found at the following link:
+
+[https://github.com/NREL/EnergyPlusDevSupport/blob/master/DesignDocuments/Proposals/NFP_4pipeBeamAirTerminal.docx](https://github.com/NREL/EnergyPlusDevSupport/blob/master/DesignDocuments/Proposals/NFP_4pipeBeamAirTerminal.docx)
+
+This new air terminal is closely related to the existing cooled beam air terminal unit implemented in HVACCooledBeam.hh and HVACCooledBeam.cc. However the implementation will depart from the existing pattern for such air terminal units and introduce a new OO pattern for air terminal units. Three new source code files will be added called, HVACFourPipeBeam.hh, HVACFourPipeBeam.cc, and AirTerminalUnit.hh.  
+
+This design document first describes how the model is connected to the rest of EnergyPlus, then summarizes the implementation and data, and finally presents the full IDD to document input syntax. 
+ 
+## Connections to the rest of EnergyPlus ##
+
+This section describes changes outside of the model-specific new source code files that are needed to connect the new model the rest of EnergyPlus.
+
+In DataDefineEquip.cc, a new integer constant will be added to identify the type of air distribution unit: 
+
+	int const SingleDuctConstVolFourPipeBeam( 17 );
+Also the data structure ZoneAirEquip will be expanded to add a shared pointer to an instance of an AirTerminalUnit
+
+		std::shared_ptr< AirTerminalUnit > airTerminalPtr;
+
+In ZoneAirLoopEquipmentManager.cc, a new call to simulate the air terminal will be added that uses the object reference and directly calls the simulate method on a specific instance:
+
+	} else if ( SELECT_CASE_var == SingleDuctConstVolFourPipeBeam ) {
+		AirDistUnit( AirDistUnitNum ).airTerminalPtr.simulate( FirstHVACIteration, NonAirSysOutput );   
+
+and the ADU type number filled and the object instance pointer filled by calling the four pipe beam's factory method (which triggers get input):	
+
+	} else if ( SameString( AirDistUnit( AirDistUnitNum ).EquipType( AirDistCompUnitNum ), "AirTerminal:SingleDuct:ConstantVolume:FourPipeBeam" ) ) {
+					AirDistUnit( AirDistUnitNum ).EquipType_Num( AirDistCompUnitNum ) = SingleDuctConstVolFourPipeBeam;
+			AirDistUnit( AirDistUnitNum ).airTerminalPtr = FourPipeBeam::HVACFourPipeBeam::fourPipeBeamFactory(SingleDuctConstVolFourPipeBeam, AirDistUnit( AirDistUnitNum ).EquipName( 1 ));
+
+In MixedAir.cc, a warning message testing for single duct air terminals will be extended to check for the four pipe beam terminal.
+
+The thermal coupling the zone heat balance model is by two methods, as is done for the existing cooled beam model.  First, the system node  that is the inlet to the zone will have its properties set by the model.  Second, the term NonAirSysOutput, which is an argument to the simulation call will be filled with the beam sensible heating or cooling capacity.   
+
+This air terminal unit will also connect directly to Plant as a Zone HVAC demand component.  DataPlant.cc, DataPlant.hh, PlantManager.cc,PlantLoopEquip.cc, and PlantLoopSolver.cc and will be modified to add the four pipe beam as component # 92 (TypeOf_FourPipeBeamAirTerminal) following the existing pattern for HVAC air side components. The air terminal unit model is not actually called to simulate from plant and so no conflicts are expected with  [https://github.com/NREL/EnergyPlus/pull/4945](https://github.com/NREL/EnergyPlus/pull/4945).
+
+This air terminal unit will have autosizing and will interact with sizing data generated elsewhere in the program. The following central sizing data are expected to be used in the sizing calculations: 
+
+	    TermUnitFinalZoneSizing.CoolingAirVolFlow, 
+	    TermUnitFinalZoneSizing.DesCoolLoad
+	    TermUnitFinalZoneSizing.HeatingAirVolFlow, 
+		TermUnitFinalZoneSizing.DesHeatLoad
+	    FinalZoneSizing.DesCoolCoilInTempTU, 
+	    FinalZoneSizing.DesCoolCoilInHumRatTU
+	    FinalZoneSizing.DesHeatCoilInTempTU
+	    FinalZoneSizing.DesHeatCoilInHumRatTU
+	    FinalZoneSizing.ZoneTempAtCoolPeak,
+	    FinalZoneSizing.ZoneHumRatAtCoolPeak
+	    FinalZoneSizing.ZoneTempAtHeatPeak
+	    FinalZoneSizing.ZoneHumRatAtHeatPeak
+
+GlobalNames.hh and GlobalNames.cc will be modified to allow checking for unique names across user input for air distribution units, starting with just the new four pipe beams, by adding an ADU counter as numAirDistUnits, data structure array called aDUNames, and routine named VerifyUniqueADUName().
+
+
+## Four Pipe Beam Implementation ##
+
+The model will be implemented using new OO patterns that are not yet widely implemented in the current code base.  The new pattern was developed with help from Stuart Mentzer and also follows the work done by Edwin Lee in the branch called PullLogicFromPlantComponents. The bulk of the model will be implemented as a concrete class called HVACFourPipeBeam that extends a new base class called AirTerminalUnit.  
+
+AirTerminalUnit.hh will define a bass class with virtual methods and data that are likely to be common across all types of air terminal units. HVACFourPipeBeam.hh will define a class that inherits from AirTerminalUnit.
+
+The following list summarizes the methods that will be implemented for the HVACFourPipeBeam class and notes any unique aspects.
+
+ - **simulate()**.  	This subroutine is the main simulation entry point.  It provides a central entry point to the model and is called from SimZoneAirLoopEquipment() using the new object reference stored in the AirDistUnit structure. This routine then calls the HVACFourPipeBeam object's other methods to run the model. 
+ - **fourPipeBeamFactory()**    This routine creates a new instance of an HVACFourPipeBeam and processes input data from the user and fills the local data.  This is analogous to the old style get input routines except that it returns a pointer and stores a four pipe beam in an object array.  It uses the usual calls InputProcessor including GetObjectItemNum() and GetObjectItem().  Although this is primarily model for four-pipe beams, the get input routine will allow users to omit either the hot water nodes or chilled water nodes and use the model for two-pipe beams. The get input routine will assume omitted sets of nodes are intentional and set a bool to indicate that the operation is either as a two-pipe cooled beam or two-pipe heated beam depending on the node omissions.  
+ - **init()**   This routine performs all the initialization of model data. When FirstHVACIteration is true, and primary air is scheduled to be available the air terminal inlet node is set to communicate central air flow request to the air loop model.
+ - **set_size()**	This routine calculates sizes when autosizing.  
+ - **control()**	This routine determines how the beam should operate.  It calls SolveRegulaFalsi(). 
+ - **calc()**	This routine evaluates the beam's thermal behavior for a specific control situation.  The model applies the correction curves and calculates the sensible load provided to the zone by the beam and the plant water outlet temperatures.  The model equations are described in the NFP referenced above. 
+ - **residual()** This function returns the deviation between the load desired by the zone and the load delivered by the terminal (primary supply air plus beam) under a trial control situation. It is used by SolveRegulaFalsi non-linear numerical solver. This routine calls CalcFourPipeBeam().
+ - **update()**	This routine updates the system node variables and NonAirSystemOutput to connect the model results with the the rest of EnergyPlus.    The air terminal outlet node properties are equal to the inlet node because the primary air just pass through. 
+ - **report()** This routine fills local output variables with current data. 
+
+A list of the model data that will be contained in the objects follows:
+
+			AirTerminalUnitType terminalType; // Type of air distribution unit  
+			std::string name; // name of unit
+			std::string unitType; // type of unit = AirTerminal:SingleDuct:ConstantVolume:FourPipeBeam
+			int aDUNum; // index of this unit in the corresponding air distribution unit structure
+			int airAvailSchedNum; // index to schedule for pimary air availability
+			bool airAvailable; // true if primary air is available
+			Real64 vDotDesignPrimAir; // Design primary air volume flow rate m3/s (autosizable)
+			bool vDotDesignPrimAirWasAutosized; // true if user input for design air flow was autsized on input
+			Real64 mDotDesignPrimAir; // Design primary air mass flow rate kg/s
+			int airInNodeNum; // unit air inlet system node number, air enters into air terminal unit
+			int airOutNodeNum; // unit air outlet system node number, air enters into zone from air terminal
+
+			int coolingAvailSchedNum; // index to schedule for cooling availability
+			bool coolingAvailable; // true if beam cooling is available
+			int heatingAvailSchedNum; // index to schedule for heating availability
+			bool heatingAvailable; // true if beam heating is available
+		
+			Real64 totBeamLength; // length of all the beams in the zone (autosizable) (m)
+			bool totBeamLengthWasAutosized; // true if beam length was autosized on input
+			Real64 vDotNormRatedPrimAir; // normalized primary air volume flow rate at rating point (m3/s-m)
+			Real64 mDotNormRatedPrimAir; // normalized primary air mass flow rate at rating point (kg/s-m)
+			// cooling
+			bool beamCoolingPresent;  // true if chilled water system is connected to beam
+			Real64 vDotDesignCW; // Design chilled water volume flow rate (autosizable) (m3/s)
+			bool vDotDesignCWWasAutosized; // true if use input for chilled water flow was autosized
+			Real64 mDotDesignCW; // Design chilled water mass flow rate (kg/s)
+			Real64 qDotNormRatedCooling; // normalized cooling capacity at rating point (W/m)
+			Real64 deltaTempRatedCooling; // temperature difference between zone air and entering chilled water at rating point (delta C)
+			Real64 vDotNormRatedCW; // normalized chilled water volume flow rate at rating point (m3/s-m)
+			Real64 mDotNormRatedCW; // normalized chilled water mass flow rate at rating point (kg/s-m)
+			int modCoolingQdotDeltaTFuncNum; // index to curve or table modifying cooling capacity as a function of delta T ratio
+			int modCoolingQdotAirFlowFuncNum; // index to curve or table modifying cooling capacity as a function of air flow ratio
+			int modCoolingQdotCWFlowFuncNum; // index to curve or table modifying cooling capacity as a function of chilled water flow ratio
+			Real64 mDotCW; // current chilled water mass flow rate (kg/s)
+			Real64 cWTempIn; // current inlet chilled water temperature [C]
+			Real64 cWTempOut; // current outlet chilled water temperature [C]
+			int cWInNodeNum; // chilled water inlet node
+			int cWOutNodeNum; // chilled water outlet nod
+			PlantLocation cWLocation; // chilled water plant loop location
+			//heating
+			bool beamHeatingPresent; // true if hot water system is connected to beam
+			Real64 vDotDesignHW; // Design hot water volume flow rate (autosizable) (m3/s)
+			bool vDotDesignHWWasAutosized; // true if user input for hot water flow was autosized
+			Real64 mDotDesignHW; // Design hot water mass flow rate (kg/s)
+			Real64 qDotNormRatedHeating; // normalized heating capacity at rating point (W/m)
+			Real64 deltaTempRatedHeating; // temperature difference between zone air and entering hot water at rating point (delta C)
+			Real64 vDotNormRatedHW; // normalized hot water volume flow rate at rating point (m3/s-m)
+			Real64 mDotNormRatedHW; // normalized hot water mass flow rate at rating point (kg/s-m)
+			int modHeatingQdotDeltaTFuncNum; // index to curve or table modifying heating capacity as a function of delta T ratio
+			int modHeatingQdotAirFlowFuncNum; // index to curve or table modifying heating capacity as a function of air flow ratio
+			int modHeatingQdotHWFlowFuncNum; // index to curve or table modifying heating capacity as a function of chilled water flow ratio
+			Real64 mDotHW; // current hot water mass flow rate (kg/s)
+			Real64 hWTempIn; // current inlet hot water temperature (C)
+			Real64 hWTempOut; // current outlet hot water temperature (C)
+			int hWInNodeNum; // hot water inlet node
+			int hWOutNodeNum; // hot water outlet node
+			PlantLocation hWLocation; // hot water connection location structure
+			// simulation iteration controls
+			int beamLoadReSimIndex;
+			int beamCWMassFlowReSimIndex;
+			int beamCWOutletTempReSimIndex;
+			int beamHWMassFlowReSimIndex;
+			int beamHWOutletTempReSimIndex;
+			// output variables
+			Real64 beamCoolingEnergy; // beam sensible cooling energy of all beams in the zone [J]
+			Real64 beamCoolingRate; // beam sensible cooling rate of all beams in the zone [W]
+			Real64 beamHeatingEnergy; // beam heating energy of all beams in the zone [J]
+			Real64 beamHeatingRate; // beam heating rate of all beams in the zone [W]
+			Real64 supAirCoolingEnergy; // Total cooling energy from supply air [J]
+			Real64 supAirCoolingRate; // Total cooling rate from supply air [W]
+			Real64 supAirHeatingEnergy; // Total cooling energy from supply air [J]
+			Real64 supAirHeatingRate; // Total cooling rate from supply air [W]
+			Real64 primAirFlow; // supply air flow per zone [m3/s]
+
+## Input Data Dictionary ##
+
+The IDD that defines the input syntax will be as follows:
+
+    AirTerminal:SingleDuct:ConstantVolume:FourPipeBeam
+         \memo Central air system terminal unit, single duct, constant volume, 
+         \memo with heating and/or cooling.  
+         \memo Operates as two-pipe unit if heating or cooling water is omitted.
+         \memo Heating and/or cooling can be scheduled off for dedicated ventilation.
+    A1 , \field Name
+         \type alpha
+         \required-field
+    A2 , \field Primary Air Availability Schedule Name
+         \note Primary air is supplied by central air handling unit and must be on for heating or cooling.
+         \note Schedule value > 0 means the primary air supply is available.
+         \note If this field is blank, the primary air supply is always available.
+         \type object-list
+         \object-list ScheduleNames
+    A3 , \field Cooling Availability Schedule Name
+         \note Cooling operation can be controlled separately using this availability schedule.
+         \note Schedule value > 0 means beam cooling is available.
+         \note If this field is blank, the beam cooling is always available (as long as primary air is also available).
+         \type object-list
+         \object-list ScheduleNames
+    A4 , \field Heating Availability Schedule Name
+         \note Heating operation can be controlled separately using this availability schedule.
+         \note Schedule value > 0 means beam heating is available.
+         \note If this field is blank, the beam heating is always available (as long as primary air is also available).
+         \type object-list
+         \object-list ScheduleNames
+    A5 , \field Primary Air Inlet Node Name
+         \note Name of the air system node for primary supply air entering the air distribution unit.
+         \type node
+         \required-field
+    A6 , \field Primary Air Outlet Node Name
+         \note Name of the air system node for primary supply air leaving the air distribution unit and entering the zone.
+         \type node
+         \required-field
+    A7 , \field Chilled Water Inlet Node Name
+         \note Name of the plant system node for chilled water entering the beam.
+         \note The two chilled water nodes can (only) be omitted to model a two-pipe heating only beam.
+         \type node
+    A8 , \field Chilled Water Outlet Node Name
+         \note Name of the plant system node for chilled water leaving the beam.
+         \type node
+    A9 , \field Hot Water Inlet Node Name
+         \note Name of the plant system node for hot water entering the beam.
+         \note The two hot water nodes can (only) be omitted to model a two-pipe cooling-only beam.
+         \type node
+    A10, \field Hot Water Outlet Node Name
+         \note Name of the plant system node for hot water leaving the beam.
+         \type node
+    N1 , \field Design Primary Air Volume Flow Rate
+         \type real
+         \units m3/s
+         \minimum 0.0
+         \autosizable
+         \default autosize
+    N2 , \field Design Chilled Water Volume Flow Rate
+         \type real
+         \units m3/s
+         \minimum 0.0
+         \autosizable
+         \default autosize
+    N3 , \field Design Hot Water Volume Flow Rate
+         \type real
+         \units m3/s
+         \minimum 0.0
+         \autosizable
+         \default autosize
+    N4 , \field Zone Total Beam Length
+         \note Sum of the length of all the beam units in the zone represented by this terminal unit.
+         \type real
+         \units m
+         \minimum> 0.0
+         \autosizable
+         \default autosize
+    N5 , \field Rated Primary Air Flow Rate per Meter
+         \note Primary air supply flow rate normalized by beam length.
+         \type real
+         \units m3/s-m
+         \minimum> 0.0
+         \default 0.035
+    N6 , \field Beam Rated Cooling Capacity per Meter
+         \note Sensible cooling capacity per meter of beam length at the rating point.
+         \type real
+         \units W/m
+         \minimum> 0.0
+         \default 600.0
+    N7 , \field Beam Rated Cooling Room Air Chilled Water Temperature Difference
+         \note Difference in temperature between the zone air and the entering chilled water at the rating point.
+         \type real
+         \units deltaC
+         \minimum> 0.0
+         \default 10.0
+    N8 , \field Beam Rated Chilled Water Volume Flow Rate per Meter
+         \note The volume flow rate of chilled water per meter of beam length at the rating point.
+         \type real
+         \units m3/s-m
+         \minimum> 0.0
+         \default 0.00005
+    A11, \field Beam Cooling Capacity Temperature Difference Modification Factor Curve Name
+         \note Adjusts beam cooling capacity when the temperature difference between entering water and zone air
+         \note is different than at the rating point.  Single independent variable is the ratio of the current 
+         \note temperature difference divided by the rating point temperature difference.
+         \note This field is required when beam is connected to a chilled water plant.
+         \type object-list
+         \object-list UniVariateCurves
+         \object-list UniVariateTables
+    A12, \field Beam Cooling Capacity Air Flow Modification Factor Curve Name
+         \note Adjusts beam cooling capacity when the primary air supply flow rate is different 
+         \note than at the rating point. The single independent variable is the current normalized
+         \note air flow rate divided by the normalized air flow rate at the rating point.
+         \note This field is required when beam is connected to a chilled water plant.
+         \type object-list
+         \object-list UniVariateCurves
+         \object-list UniVariateTables
+    A13, \field Beam Cooling Capacity Chilled Water Flow Modification Factor Curve Name
+         \note Adjusts beam cooling capacity when the normalized chilled water flow rate is different 
+         \note than at the rating point. The single independent variable is the current normalized
+         \note chilled water flow rate divided by the normalized chilled water flow rate at the rating point.
+         \note This field is required when beam is connected to a chilled water plant.
+         \type object-list
+         \object-list UniVariateCurves
+         \object-list UniVariateTables
+    N9 , \field Beam Rated Heating Capacity per Meter
+         \note Sensible heating capacity per meter of beam length at the rating point.
+         \type real
+         \units W/m
+         \minimum> 0.0
+         \default 1500.0
+    N10, \field Beam Rated Heating Room Air Hot Water Temperature Difference
+         \note Difference in temperature between the zone air and the entering hot water at the rating point.
+         \type real
+         \units deltaC
+         \minimum> 0.0
+         \default 27.8
+    N11, \field Beam Rated Hot Water Volume Flow Rate per Meter
+         \note The volume flow rate of hoy water per meter of beam length at the rating point.
+         \type real
+         \units m3/s-m
+         \minimum> 0.0
+         \default 0.00005
+    A14, \field Beam Heating Capacity Temperature Difference Modification Factor Curve Name
+         \note Adjusts beam heating capacity when the temperature difference between entering water and zone air
+         \note is different than at the rating point.  Single independent variable is the ratio of the current 
+         \note temperature difference divided by the rating point temperature difference.
+         \note This field is required when beam is connected to a hot water plant.
+         \type object-list
+         \object-list UniVariateCurves
+         \object-list UniVariateTables
+    A15, \field Beam Heating Capacity Air Flow Modification Factor Curve Name
+         \note Adjusts beam heating capacity when the primary air supply flow rate is different 
+         \note than at the rating point. The single independent variable is the current normalized
+         \note air flow rate divided by the normalized air flow rate at the rating point.
+         \note This field is required when beam is connected to a hot water plant.
+         \type object-list
+         \object-list UniVariateCurves
+         \object-list UniVariateTables
+    A16; \field Beam Heating Capacity Hot Water Flow Modification Factor Curve Name
+         \note Adjusts beam heating capacity when the normalized hot water flow rate is different 
+         \note than at the rating point. The single independent variable is the current normalized
+         \note hot water flow rate divided by the normalized hot water flow rate at the rating point.
+         \note This field is required when beam is connected to a hot water plant.
+         \type object-list
+         \object-list UniVariateCurves
+         \object-list UniVariateTables
